@@ -2,18 +2,20 @@
 
 #![allow(clippy::uninlined_format_args)]
 
+use std::{convert::TryInto, marker::PhantomData, num::NonZeroU32};
+
 use js_sys::Object;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-use wasm_bindgen::{JsCast, JsValue};
-use web_sys::ImageData;
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
-use web_sys::{OffscreenCanvas, OffscreenCanvasRenderingContext2d};
+use wasm_bindgen::{Clamped, JsCast, JsValue};
+use web_sys::{
+    CanvasRenderingContext2d, HtmlCanvasElement, ImageData, OffscreenCanvas,
+    OffscreenCanvasRenderingContext2d,
+};
 
-use crate::error::{InitError, SwResultExt};
-use crate::{util, NoDisplayHandle, NoWindowHandle, Rect, SoftBufferError};
-use std::convert::TryInto;
-use std::marker::PhantomData;
-use std::num::NonZeroU32;
+use crate::{
+    error::{InitError, SwResultExt},
+    util, NoDisplayHandle, NoWindowHandle, Rect, SoftBufferError,
+};
 
 /// Display implementation for the web platform.
 ///
@@ -49,6 +51,9 @@ pub struct WebImpl<D, W> {
 
     /// The buffer that we're drawing to.
     buffer: Vec<u32>,
+
+    /// Space used to convert buffer from u32 to u8 without requiring frequent allocations
+    scratch_buffer: Vec<u8>,
 
     /// Buffer has been presented.
     buffer_presented: bool,
@@ -112,6 +117,7 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> WebImpl<D, W> {
         Ok(Self {
             canvas: Canvas::Canvas { canvas, ctx },
             buffer: Vec::new(),
+            scratch_buffer: Vec::new(),
             buffer_presented: false,
             size: None,
             window_handle: window,
@@ -128,6 +134,7 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> WebImpl<D, W> {
         Ok(Self {
             canvas: Canvas::OffscreenCanvas { canvas, ctx },
             buffer: Vec::new(),
+            scratch_buffer: Vec::new(),
             buffer_presented: false,
             size: None,
             window_handle: window,
@@ -166,6 +173,8 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> WebImpl<D, W> {
         if self.size != Some((width, height)) {
             self.buffer_presented = false;
             self.buffer.resize(total_len(width.get(), height.get()), 0);
+            self.scratch_buffer
+                .resize(total_len(width.get(), height.get()) * 4, 0);
             self.canvas.set_width(width.get());
             self.canvas.set_height(height.get());
             self.size = Some((width, height));
@@ -244,7 +253,7 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> WebImpl<D, W> {
         for rect in damage {
             // This can only throw an error if `data` is detached, which is impossible.
             self.canvas
-                .put_image_data(
+                .put_image_data_with_dirty_x_and_dirty_y_and_dirty_width_and_dirty_height(
                     &image_data,
                     union_damage.x.into(),
                     union_damage.y.into(),
@@ -256,6 +265,21 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> WebImpl<D, W> {
                 .unwrap();
         }
 
+        self.buffer_presented = true;
+
+        Ok(())
+    }
+    /// Assumes ABGR, not default XRGB ordering
+    fn present(&mut self) -> Result<(), SoftBufferError> {
+        let (buffer_width, buffer_height) = self
+            .size
+            .expect("Must set size of surface before calling `present()`");
+        let bytes = bytemuck::cast_slice::<u32, u8>(self.buffer.as_slice());
+        let data = Clamped(&bytes);
+        let (width, height): (u32, u32) = (buffer_width.into(), buffer_height.into());
+        let imagedata = ImageData::new_with_u8_clamped_array(Clamped(&data), width)
+            .expect("couldn't build imagedata");
+        self.canvas.put_image_data(&imagedata, 0., 0.).unwrap();
         self.buffer_presented = true;
 
         Ok(())
@@ -347,7 +371,7 @@ impl Canvas {
     // NOTE: suppress the lint because we mirror `CanvasRenderingContext2D.putImageData()`, and
     // this is just an internal API used by this module only, so it's not too relevant.
     #[allow(clippy::too_many_arguments)]
-    fn put_image_data(
+    fn put_image_data_with_dirty_x_and_dirty_y_and_dirty_width_and_dirty_height(
         &self,
         imagedata: &ImageData,
         dx: f64,
@@ -366,6 +390,12 @@ impl Canvas {
                 .put_image_data_with_dirty_x_and_dirty_y_and_dirty_width_and_dirty_height(
                     imagedata, dx, dy, dirty_x, dirty_y, width, height,
                 ),
+        }
+    }
+    fn put_image_data(&self, imagedata: &ImageData, dx: f64, dy: f64) -> Result<(), JsValue> {
+        match self {
+            Self::Canvas { ctx, .. } => ctx.put_image_data(&imagedata, dx, dy),
+            Self::OffscreenCanvas { ctx, .. } => ctx.put_image_data(&imagedata, dx, dy),
         }
     }
 }
@@ -393,16 +423,7 @@ impl<'a, D: HasDisplayHandle, W: HasWindowHandle> BufferImpl<'a, D, W> {
 
     /// Push the buffer to the canvas.
     pub fn present(self) -> Result<(), SoftBufferError> {
-        let (width, height) = self
-            .imp
-            .size
-            .expect("Must set size of surface before calling `present()`");
-        self.imp.present_with_damage(&[Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        }])
+        self.imp.present()
     }
 
     pub fn present_with_damage(self, damage: &[Rect]) -> Result<(), SoftBufferError> {
