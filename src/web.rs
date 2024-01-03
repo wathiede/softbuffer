@@ -52,9 +52,6 @@ pub struct WebImpl<D, W> {
     /// The buffer that we're drawing to.
     buffer: Vec<u32>,
 
-    /// Space used to convert buffer from u32 to u8 without requiring frequent allocations
-    scratch_buffer: Vec<u8>,
-
     /// Buffer has been presented.
     buffer_presented: bool,
 
@@ -117,7 +114,6 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> WebImpl<D, W> {
         Ok(Self {
             canvas: Canvas::Canvas { canvas, ctx },
             buffer: Vec::new(),
-            scratch_buffer: Vec::new(),
             buffer_presented: false,
             size: None,
             window_handle: window,
@@ -134,7 +130,6 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> WebImpl<D, W> {
         Ok(Self {
             canvas: Canvas::OffscreenCanvas { canvas, ctx },
             buffer: Vec::new(),
-            scratch_buffer: Vec::new(),
             buffer_presented: false,
             size: None,
             window_handle: window,
@@ -173,8 +168,6 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> WebImpl<D, W> {
         if self.size != Some((width, height)) {
             self.buffer_presented = false;
             self.buffer.resize(total_len(width.get(), height.get()), 0);
-            self.scratch_buffer
-                .resize(total_len(width.get(), height.get()) * 4, 0);
             self.canvas.set_width(width.get());
             self.canvas.set_height(height.get());
             self.size = Some((width, height));
